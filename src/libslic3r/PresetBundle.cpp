@@ -532,6 +532,15 @@ PresetsConfigSubstitutions PresetBundle::load_presets(AppConfig &config, Forward
         load_user_presets(dir_user_presets, substitution_rule);
     }
 
+    // ORCA #12105 (Phase 4): one-time migration of legacy flat user printer presets to a distinct
+    // user printer_model, so they group per-model in the printer dropdown and changing the nozzle
+    // stays on the user's printer instead of reverting to the system preset. Field-only, no rename.
+    // Runs before load_selections so the active preset is selected from the migrated state.
+    if (config.get("user_printer_variants_migrated") != "1") {
+        this->printers.migrate_user_models_for_variants("Copy");
+        config.set("user_printer_variants_migrated", "1");
+    }
+
     this->update_multi_material_filament_presets();
     this->update_compatible(PresetSelectCompatibleType::Never);
 
