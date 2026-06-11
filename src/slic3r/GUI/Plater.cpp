@@ -2313,6 +2313,9 @@ void Sidebar::create_printer_preset()
     CreatePrinterPresetDialog dlg(wxGetApp().mainframe);
     int                       res = dlg.ShowModal();
     if (wxID_OK == res) {
+        // ORCA #12105: reloading the full preset tree after a (possibly multi-nozzle) create can take
+        // a while; show a busy cursor so the UI doesn't appear frozen.
+        wxBusyCursor wait;
         wxGetApp().load_current_presets();
         wxGetApp().mainframe->update_side_preset_ui();
         update_ui_from_settings();

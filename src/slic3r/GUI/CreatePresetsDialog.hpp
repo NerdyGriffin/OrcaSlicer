@@ -106,6 +106,7 @@ protected:
     void        create_printer_page1(wxWindow *parent);
     wxBoxSizer *create_type_item(wxWindow *parent);
     wxBoxSizer *create_printer_item(wxWindow *parent);
+    wxBoxSizer *create_printer_model_name_item(wxWindow *parent); // ORCA #12105: editable user printer_model
     wxBoxSizer *create_nozzle_diameter_item(wxWindow *parent);
     wxBoxSizer *create_bed_shape_item(wxWindow *parent);
     wxBoxSizer *create_bed_size_item(wxWindow *parent);
@@ -114,6 +115,7 @@ protected:
     wxBoxSizer *create_hot_bed_svg_item(wxWindow *parent);
     wxBoxSizer *create_max_print_height_item(wxWindow *parent);
     wxWindow   *create_page1_dialog_buttons(wxWindow *parent);
+    void        relayout_page1(bool recenter = false); // ORCA #12105: re-fit page-1 scroll area, capped to screen height
     //Improt Presets Page2
     void create_printer_page2(wxWindow *parent);
     wxBoxSizer *create_printer_preset_item(wxWindow *parent);
@@ -131,6 +133,15 @@ protected:
     void          select_curr_radiobox(std::vector<std::pair<RadioBox *, wxString>> &radiobox_list, int btn_idx);
     void          select_all_preset_template(std::vector<std::pair<::CheckBox *, Preset *>> &preset_templates);
     void          deselect_all_preset_template(std::vector<std::pair<::CheckBox *, Preset *>> &preset_templates);
+    // ORCA #12105 Phase 5: select/deselect only the system or only the user presets in a template list.
+    void          select_preset_template_subset(std::vector<std::pair<::CheckBox *, Preset *>> &preset_templates, bool value, bool system);
+    // Build a "System"/"User" sub-section (label + checkbox grid + its own Select All/Deselect All).
+    // out_section is the whole sub-section panel, hidden when its grid ends up empty.
+    void          add_template_subsection(wxWindow *parent, wxBoxSizer *sizer, const wxString &label, wxPanel *&out_section,
+                                          wxPanel *&out_panel, wxGridSizer *&out_grid,
+                                          std::vector<std::pair<::CheckBox *, Preset *>> *vec, bool system);
+    void          clear_preset_templates(); // clear the four template grids
+    void          update_template_section_visibility(); // hide System/User sub-sections whose grid is empty
     void          update_presets_list(bool jast_template = false);
     void          on_preset_model_value_change(wxCommandEvent &e);
     void          clear_preset_combobox();
@@ -141,12 +152,32 @@ protected:
     void          load_model_stl();
     bool          load_system_and_user_presets_with_curr_model(PresetBundle &temp_preset_bundle, bool just_template = false);
     void          generate_process_presets_data(std::vector<Preset const *> presets, std::string nozzle);
+    // ORCA #12105 Phase 4: create one printer preset (+ cloned filament/process) for a single nozzle,
+    // based on `base_preset`. Returns false if the user cancelled (abort the whole bulk operation).
+    bool          create_printer_preset_for_nozzle(PresetBundle *preset_bundle, const Preset &base_preset, const std::string &printer_model_name,
+                                                    const std::string &printer_nozzle_name, const wxString &preset_type,
+                                                    const std::vector<Preset const *> &selected_filament_presets,
+                                                    const std::vector<Preset const *> &selected_process_presets, bool &rewritten);
+    // ORCA #12105: resolve, for one nozzle variant, that nozzle's own system base printer preset and
+    // its compatible system process presets (process values are nozzle-specific). Returns a heap base
+    // Preset* (caller owns) or nullptr on failure.
+    Preset *      resolve_nozzle_base_and_processes(const std::string &variant, std::vector<Preset> &out_processes);
     void          update_preset_list_size();
     std::string   get_printer_vendor() const;
     std::string   get_printer_model() const;
-    std::string   get_nozzle_diameter() const;
+    std::string   get_nozzle_diameter() const;                // primary (first) nozzle
+    std::vector<std::string> get_selected_nozzle_diameters() const; // ORCA #12105 Phase 4: all chosen nozzles
+    void          update_nozzle_summary_label();              // refresh the multi-select trigger label
     std::string   get_custom_printer_model() const;
     std::string   get_custom_printer_name() const;
+    // ORCA #12105: suggest a distinct user printer_model ("<inherited> - Copy") and refuse to reuse a system model.
+    void          update_suggested_printer_model_name();
+    bool          printer_model_conflicts_with_system(const std::string &printer_model) const;
+    // ORCA #12105 Phase 3: resolve the selected system base and pre-fill page-1 geometry from it.
+    void          update_inherited_geometry();
+    void          set_bed_asset_label(wxStaticText *tip, const std::string &path); // STL/SVG filename label
+    void          update_geometry_reset_arrows();                                  // show/hide reset-to-inherited arrows
+    void          reset_geometry_to_defaults();                                     // custom-vendor path: clear inheritance, restore manual defaults
     wxArrayString printer_preset_sort_with_nozzle_diameter(const VendorProfile &vendor_profile, float nozzle_diameter);
 
     wxBoxSizer *create_radio_item(wxString title, wxWindow *parent, wxString tooltip, std::vector<std::pair<RadioBox *, wxString>> &radiobox_list);
@@ -184,13 +215,18 @@ private:
     ComboBox *                                         m_select_vendor                  = nullptr;
     ComboBox *                                         m_select_model                   = nullptr;
     ComboBox *                                         m_select_printer                 = nullptr;
+    VendorMap                                          m_page1_vendors;                            // ORCA #12105: real vendor profiles for page-1 vendor/model
     ::CheckBox *                                       m_can_not_find_vendor_combox     = nullptr;
     ::CheckBox *                                       m_can_not_find_nozzle_checkbox   = nullptr;
     wxStaticText *                                     m_can_not_find_vendor_text       = nullptr;
     wxTextCtrl *                                       m_custom_vendor_text_ctrl        = nullptr;
     wxTextCtrl *                                       m_custom_model_text_ctrl         = nullptr;
     wxTextCtrl *                                       m_custom_nozzle_diameter_ctrl    = nullptr;
-    ComboBox *                                         m_nozzle_diameter                = nullptr;
+    TextInput *                                        m_printer_model_name_input       = nullptr; // ORCA #12105: editable user printer_model
+    wxBoxSizer *                                       m_printer_model_name_sizer       = nullptr; // ORCA #12105: row, toggled per create-type
+    std::string                                        m_suggested_printer_model_name;            // last auto-suggestion, to detect user edits
+    Button *                                           m_nozzle_select_btn              = nullptr; // ORCA #12105 Phase 4: multi-select trigger
+    std::vector<std::string>                           m_selected_nozzles               = {"0.4"};  // source of truth for chosen nozzles
     ComboBox *                                         m_printer_vendor                 = nullptr;
     ComboBox *                                         m_printer_model                  = nullptr;
     TextInput *                                        m_bed_size_x_input               = nullptr;
@@ -198,10 +234,19 @@ private:
     TextInput *                                        m_bed_origin_x_input             = nullptr;
     TextInput *                                        m_bed_origin_y_input             = nullptr;
     TextInput *                                        m_print_height_input             = nullptr;
-    wxGridSizer *                                      m_filament_preset_template_sizer = nullptr;
-    wxGridSizer *                                      m_process_preset_template_sizer  = nullptr;
-    wxPanel *                                          m_filament_preset_panel          = nullptr;
-    wxPanel *                                          m_process_preset_panel           = nullptr;
+    // ORCA #12105 Phase 5: filament/process template lists are split into System + User sub-sections.
+    wxGridSizer *                                      m_filament_system_grid           = nullptr;
+    wxGridSizer *                                      m_filament_user_grid             = nullptr;
+    wxGridSizer *                                      m_process_system_grid            = nullptr;
+    wxGridSizer *                                      m_process_user_grid              = nullptr;
+    wxPanel *                                          m_filament_system_panel          = nullptr;
+    wxPanel *                                          m_filament_user_panel            = nullptr;
+    wxPanel *                                          m_process_system_panel           = nullptr;
+    wxPanel *                                          m_process_user_panel             = nullptr;
+    wxPanel *                                          m_filament_system_section        = nullptr; // whole sub-section, hidden when empty
+    wxPanel *                                          m_filament_user_section          = nullptr;
+    wxPanel *                                          m_process_system_section         = nullptr;
+    wxPanel *                                          m_process_user_section           = nullptr;
     wxPanel *                                          m_preset_template_panel          = nullptr;
     wxBoxSizer *                                       m_filament_sizer                 = nullptr;
     wxPanel *                                          m_printer_info_panel             = nullptr;
@@ -212,6 +257,20 @@ private:
     wxStaticText *                                     m_upload_svg_tip_text            = nullptr;
     std::string                                        m_custom_texture;
     std::string                                        m_custom_model;
+
+    // ORCA #12105: page-1 geometry inherits from the selected system base; fields pre-fill from it
+    // and (Phase 3b) offer reset-to-inherited arrows. Empty/false in the custom-vendor path.
+    bool                                               m_has_inherited_geometry         = false;
+    std::string                                        m_inherited_size_x, m_inherited_size_y;
+    std::string                                        m_inherited_origin_x, m_inherited_origin_y;
+    std::string                                        m_inherited_height;
+    std::string                                        m_inherited_bed_model, m_inherited_bed_texture; // shipped bed STL/SVG (machine_model metadata)
+    // Reset-to-inherited arrows (Phase 3b). One shared arrow for the printable_area trio
+    // (bed shape/printable space/origin), plus one each for max height, hot bed STL, hot bed SVG.
+    ScalableButton *                                   m_reset_printable_area           = nullptr;
+    ScalableButton *                                   m_reset_print_height             = nullptr;
+    ScalableButton *                                   m_reset_bed_stl                  = nullptr;
+    ScalableButton *                                   m_reset_bed_svg                  = nullptr;
 };
 
 enum SuccessType {

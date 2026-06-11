@@ -3737,13 +3737,21 @@ Preset *PresetBundle::get_similar_printer_preset(std::string printer_model, std:
     auto printer_variant_old = printers.get_selected_preset().config.opt_string("printer_variant");
     std::map<std::string, Preset*> printer_presets;
     for (auto &preset : printers.m_presets) {
-        if (printer_variant.empty() && !preset.is_system)
-            continue;
         if (preset.config.opt_string("printer_model") == printer_model)
             printer_presets.insert({preset.name, &preset});
     }
     if (printer_presets.empty())
         return nullptr;
+    // ORCA #12105: for a bare model-select (empty variant), prefer system presets when the model
+    // has any (preserves the original system-model behaviour). A user-defined printer_model has no
+    // system match, so its user nozzle variants are resolved instead.
+    if (printer_variant.empty()) {
+        bool has_system = std::any_of(printer_presets.begin(), printer_presets.end(),
+                                      [](const auto &p) { return p.second->is_system; });
+        if (has_system)
+            for (auto it = printer_presets.begin(); it != printer_presets.end();)
+                it = it->second->is_system ? std::next(it) : printer_presets.erase(it);
+    }
     auto prefer_printer = printers.get_selected_preset().alias; //.name ORCA use alias instead "name" for calling system presets. otherwise nozzle combo will not change printer presets if they custom named
 
     if (!printer_variant.empty())
