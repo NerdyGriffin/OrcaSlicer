@@ -804,6 +804,10 @@ void Tab::OnActivate()
     }
 #endif
 
+    // The OnActivate() that shows the tab builds the page.
+    if (wxGetApp().mainframe != nullptr && !wxGetApp().mainframe->is_active_and_shown_tab(m_parent))
+        return;
+
     // BBS: select on first active
     if (!m_active_page)
         restore_last_select_item();
@@ -7159,6 +7163,16 @@ void Tab::restore_last_select_item()
     m_tabctrl->SelectItem(item);
 }
 
+bool Tab::page_build_pending() const
+{
+    return m_active_page != nullptr && m_active_page->build_pending();
+}
+
+bool Tab::page_build_step()
+{
+    return m_active_page != nullptr && m_active_page->build_step(m_mode);
+}
+
 void Tab::update_description_lines()
 {
     if (m_active_page && m_active_page->title() == "Dependencies" && m_parent_preset_description_line)
@@ -7375,7 +7389,7 @@ void Tab::OnKeyDown(wxKeyEvent& event)
 
 void Tab::compare_preset()
 {
-    wxGetApp().mainframe->diff_dialog.show(m_type);
+    DiffPresetDialog::ensure()->show(m_type);
 }
 
 void Tab::transfer_options(const std::string &name_from, const std::string &name_to, std::vector<std::string> options)
@@ -7410,6 +7424,7 @@ void Tab::transfer_options(const std::string &name_from, const std::string &name
 // Wizard calls save_preset with a name "My Settings", otherwise no name is provided and this method
 // opens a Slic3r::GUI::SavePresetDialog dialog.
 //BBS: add project embedded preset relate logic
+
 void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_project, bool from_input, std::string input_name )
 {
     // ORCA: Validate before opening any save-name UI for filament presets.
@@ -7446,6 +7461,42 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
     //BBS record current preset name
     Preset& edited_preset = m_presets->get_edited_preset();
     std::string curr_preset_name = edited_preset.name;
+
+    // ORCA #12105: For printer presets, the dialog field holds the user MODEL name. Derive the
+    // per-nozzle VARIANT preset name "<model> X.X nozzle" and stamp printer_model / printer_variant,
+    // so a user's printer behaves like a system one: grouped per-model in the dropdown, with nozzle
+    // changes staying within the user's own variants. The variant keeps inheriting the source system
+    // nozzle preset (handled by save_current_preset), mirroring the system file layout.
+    // ORCA #12105: here `name` is a bare user MODEL (Save dialog field / Add Nozzle Size), from which
+    // the per-nozzle variant name is derived. Exclude re-saves that pass the full preset name — e.g.
+    // the "Detach preset" button does save_preset(edited_preset.name, true) — via
+    // `name != curr_preset_name`, so a full "<model> X.X nozzle" name is never mistaken for the model
+    // (which would double-append the suffix and stamp the wrong printer_model).
+    if (m_type == Preset::TYPE_PRINTER && !from_input && !name.empty() && name != curr_preset_name) {
+        // Trim so a whitespace-padded model can't stamp a padded printer_model or a doubled-space
+        // "<model>  X.X nozzle" variant name. The Save dialog already blocks trailing spaces inline.
+        std::string model_name = name;
+        boost::trim(model_name);
+        if (model_name.empty())
+            return; // nothing to save under an empty model name (the Save dialog blocks this too)
+        // ORCA #12105: a user printer_model must not collide with a built-in (system) model, or it
+        // would hijack per-model grouping and compatibility resolution. The Save dialog blocks this
+        // inline (orange warning in SavePresetDialog::Item::update); this is a defensive backstop for
+        // non-dialog callers — refuse silently rather than overwrite a built-in model.
+        const std::vector<std::string> sys_models = wxGetApp().preset_bundle->printers.system_printer_models();
+        if (std::find(sys_models.begin(), sys_models.end(), model_name) != sys_models.end()) {
+            BOOST_LOG_TRIVIAL(warning) << "save_preset: refused user printer_model colliding with system model '" << model_name << "'";
+            return;
+        }
+        std::string nozzle_str;
+        if (auto* nd = dynamic_cast<const ConfigOptionFloats*>(edited_preset.config.option("nozzle_diameter")))
+            if (!nd->values.empty())
+                nozzle_str = format_printer_variant(nd->values.front());
+        edited_preset.config.option<ConfigOptionString>("printer_model", true)->value   = model_name;
+        edited_preset.config.option<ConfigOptionString>("printer_variant", true)->value = nozzle_str;
+        if (!nozzle_str.empty())
+            name = model_name + " " + nozzle_str + " nozzle";
+    }
 
     bool exist_preset = false;
     Preset* new_preset = m_presets->find_preset(name, false);
@@ -7543,8 +7594,10 @@ void Tab::save_preset(std::string name /*= ""*/, bool detach, bool save_to_proje
             wxGetApp().get_tab(preset_type)->update_tab_ui();
     }
 
-    // update preset comboboxes in DiffPresetDlg
-    wxGetApp().mainframe->diff_dialog.update_presets(m_type);
+    // show() reloads the presets, so only a visible Compare dialog needs updating.
+    DiffPresetDialog* diff_dialog = DiffPresetDialog::if_built();
+    if (diff_dialog != nullptr && diff_dialog->IsShown())
+        diff_dialog->update_presets(m_type);
 }
 
 // Called for a currently selected preset.
@@ -8604,20 +8657,8 @@ void Page::activate(ConfigOptionMode mode, std::function<void()> throw_if_cancel
 #else
     //m_vsizer->AddSpacer(10);
 #endif
-#if HIDE_FIRST_SPLIT_LINE
-    // BBS: no line spliter for first group
-    bool first = true;
-#endif
-    for (auto group : m_optgroups) {
-        if (!group->activate(throw_if_canceled))
-            continue;
-        m_vsizer->Add(group->sizer, 0, wxEXPAND | (group->is_legend_line() ? (wxLEFT|wxTOP) : wxALL), m_parent->FromDIP(5)); // ORCA use less margin on parameters section
-        group->update_visibility(mode);
-#if HIDE_FIRST_SPLIT_LINE
-        if (first) group->stb->Hide();
-        first = false;
-#endif
-        group->reload_config();
+    for (size_t i = 0; i < m_optgroups.size(); ++i) {
+        activate_group(i, mode, throw_if_canceled);
         throw_if_canceled();
     }
 
@@ -8634,6 +8675,41 @@ void Page::activate(ConfigOptionMode mode, std::function<void()> throw_if_cancel
         }
     });
 #endif
+}
+
+// Builds one option group; false when it already has its controls.
+bool Page::activate_group(size_t i, ConfigOptionMode mode, std::function<void()> throw_if_canceled)
+{
+    auto& group = m_optgroups[i];
+    if (!group->activate(throw_if_canceled))
+        return false;
+    m_vsizer->Add(group->sizer, 0, wxEXPAND | (group->is_legend_line() ? (wxLEFT|wxTOP) : wxALL), m_parent->FromDIP(5)); // ORCA use less margin on parameters section
+    group->update_visibility(mode);
+#if HIDE_FIRST_SPLIT_LINE
+    // BBS: no line spliter for first group
+    if (i == 0) group->stb->Hide();
+#endif
+    group->reload_config();
+    return true;
+}
+
+// The first group without controls.
+size_t Page::next_group_to_build() const
+{
+    return std::find_if(m_optgroups.begin(), m_optgroups.end(), [](const auto& group) { return !group->is_activated(); }) - m_optgroups.begin();
+}
+
+bool Page::build_pending() const
+{
+    return next_group_to_build() < m_optgroups.size();
+}
+
+bool Page::build_step(ConfigOptionMode mode)
+{
+    const size_t i = next_group_to_build();
+    if (i < m_optgroups.size())
+        activate_group(i, mode, [] {});
+    return build_pending();
 }
 
 void Page::clear()

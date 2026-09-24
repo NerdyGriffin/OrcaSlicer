@@ -73,6 +73,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/LocalesUtils.hpp" // ORCA #12105: locale-safe string_to_double_decimal_point
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/PublishSettings.hpp"
 #include "slic3r/Utils/CrealityPrint.hpp"
@@ -136,6 +137,7 @@
 #include "MsgDialog.hpp"
 #include "Widgets/MultiNozzleSync.hpp"           // NozzleOption, tryPopUpMultiNozzleDialog, setExtruderNozzleCount
 #include "DeviceCore/DevNozzleSystem.h"          // DevNozzle, GetExtNozzles / GetRackNozzles
+#include "AddNozzleSizeDialog.hpp" // ORCA #12105
 #include "ProjectDirtyStateManager.hpp"
 #include "Gizmos/GLGizmoSimplify.hpp" // create suggestion notification
 #include "Gizmos/GLGizmoSVG.hpp" // Drop SVG file
@@ -260,17 +262,15 @@ wxDEFINE_EVENT(EVT_NOTICE_FULL_SCREEN_CHANGED, IntEvent);
 #define PRINTER_PANEL_RADIUS (6) // ORCA
 #define BTN_SYNC_SIZE (wxSize(FromDIP(96), FromDIP(98)))
 
-static string get_diameter_string(float diameter)
-{
-    std::ostringstream stream; // ORCA ensure 0.25 returned as 0.25. previous code returned as 0.2 because of std::setprecision(1)
-    stream << std::fixed << std::setprecision(2) << diameter;  // Use 2 decimals to capture 0.25 / 0.15 reliably
-    std::string s = stream.str();
-    if (s.find('.') != std::string::npos) {   // Remove trailing zeros, but keep at least one decimal if needed
-        s.erase(s.find_last_not_of('0') + 1);
-        if (s.back() == '.') s += '0';        // Ensure "1." → "1.0"
-    }
-    return s;
-}
+// ORCA #12105: delegate to the shared libslic3r formatter so the sidebar dropdown and the printer
+// save flow produce identical printer_variant strings ("0.25"/"0.15"/"1.0").
+static string get_diameter_string(float diameter) { return format_printer_variant(diameter); }
+
+// ORCA #12105: label of the "Add nozzle" action item shown at the end of the nozzle dropdown for user
+// printers, styled with the same built-in separator() helper the Printer/Filament dropdowns use for
+// "Create printer" etc. (platform-specific dashes). Used both to append the item and to recognize it
+// when selected, so the two must call this function.
+static wxString add_nozzle_item_label() { return PresetComboBox::separator(L("Add nozzle")); }
 
 template <typename T, typename OptionType>
 static void set_config_values(DynamicPrintConfig *config, const std::string &key, T value)
@@ -809,6 +809,9 @@ struct Sidebar::priv
     // otherwise reuses the app_config-cached option when the machine's nozzle config is unchanged.
     std::optional<NozzleOption> get_nozzle_options(MachineObject* obj, int extruder_count, bool support_multi_nozzle, bool is_manual);
     bool switch_diameter(bool single);
+    // ORCA #12105: open the Add Nozzle Size dialog for the selected user printer and fork the chosen
+    // sizes into new user variants. Triggered by the "--Add nozzle --" nozzle-dropdown item.
+    void add_nozzle_size_to_user_printer();
     void update_sync_status(const MachineObject* obj);
 
     // Filament Track Switch (H2-family accessory): true only when the connected printer is the
@@ -1589,6 +1592,15 @@ bool Sidebar::priv::switch_diameter(bool single)
         }
     }
     
+    // ORCA #12105: the "--Add nozzle --" action item in the nozzle dropdown. Open the add
+    // dialog, then refresh the nozzle combos so the transient sentinel selection is replaced by the
+    // actual current nozzle (whether or not sizes were added).
+    if (diameter == add_nozzle_item_label()) {
+        add_nozzle_size_to_user_printer();
+        wxGetApp().plater()->sidebar().update_presets(Preset::TYPE_PRINTER);
+        return false;
+    }
+
     // ORCA: Check if the selected diameter matches the current nozzle diameter in the config
     Preset& printer_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
     auto* nozzle_diameter = dynamic_cast<const ConfigOptionFloats*>(printer_preset.config.option("nozzle_diameter"));
@@ -1599,7 +1611,26 @@ bool Sidebar::priv::switch_diameter(bool single)
             return true;
         }
     }
-    
+
+    // ORCA #12105: For a USER printer, switch among the user's own nozzle variants and never
+    // fall through to a system preset (which would discard the user's customizations). A user
+    // printer is identified by a distinct user-defined printer_model shared across its variants.
+    if (printer_preset.is_user()) {
+        auto& printers = wxGetApp().preset_bundle->printers;
+        const std::string user_model = printer_preset.config.opt_string("printer_model");
+        auto* tab = wxGetApp().get_tab(Preset::TYPE_PRINTER);
+        const Preset* user_variant = printers.find_custom_preset_by_model_and_variant(user_model, diameter.ToStdString());
+        if (user_variant != nullptr) {
+            if (Preset* v = printers.find_preset(user_variant->name, false)) v->is_visible = true; // force visible
+            return tab->select_preset(user_variant->name);
+        }
+        // ORCA #12105: no user variant for this size. Do NOT auto-create one, and never fall through
+        // to a system preset (which would discard the user's customizations). The dropdown only lists
+        // existing variants, so this is reached only in edge cases; keep the current printer selected.
+        // New nozzle sizes are added explicitly via File > Add Nozzle Size.
+        return false;
+    }
+
     auto preset          = wxGetApp().preset_bundle->get_similar_printer_preset({}, diameter.ToStdString());
     if (preset == nullptr) {
         // ORCA add a text. this appears when user tries to change nozzle value but config doesnt have a inherited or compatible preset
@@ -2003,6 +2034,116 @@ void Sidebar::priv::update_extruder_separator_icon(bool show, bool ready)
 
     if (m_panel_printer_content)
         m_panel_printer_content->Refresh();
+}
+
+void Sidebar::priv::add_nozzle_size_to_user_printer()
+{
+    auto& printers = wxGetApp().preset_bundle->printers;
+    const Preset& sel = printers.get_selected_preset();
+    if (!sel.is_user())
+        return; // the dropdown item is only shown for user printers; defensive guard
+
+    const std::string user_model = sel.config.opt_string("printer_model");
+    const Preset* base = printers.get_preset_base(sel);
+    const std::string sys_model = (base != nullptr && base->is_system) ? base->config.opt_string("printer_model") : std::string();
+    if (user_model.empty() || sys_model.empty()) {
+        MessageDialog dlg(plater, _L("This printer is not based on a built-in model, so its nozzle sizes can't be derived automatically."),
+            _L("Add nozzle size"), wxOK | wxICON_INFORMATION);
+        dlg.ShowModal();
+        return;
+    }
+
+    // Sizes the user already has, and every size the originating system model offers.
+    std::set<std::string> existing, system_sizes;
+    for (const Preset& p : printers)
+        if (p.is_user() && p.config.opt_string("printer_model") == user_model)
+            existing.insert(p.config.opt_string("printer_variant"));
+    for (const Preset& p : printers)
+        if (p.is_system && p.config.opt_string("printer_model") == sys_model)
+            system_sizes.insert(p.config.opt_string("printer_variant"));
+    std::vector<std::string> addable;
+    for (const std::string& s : system_sizes)
+        if (existing.count(s) == 0) addable.push_back(s);
+    std::sort(addable.begin(), addable.end(),
+              [](const std::string& a, const std::string& b) { return string_to_double_decimal_point(a) < string_to_double_decimal_point(b); });
+
+    AddNozzleSizeDialog dlg(plater, user_model, addable,
+                            std::vector<std::string>(existing.begin(), existing.end()));
+    if (dlg.ShowModal() != wxID_OK)
+        return;
+
+    std::vector<std::string> to_add = dlg.get_checked_sizes();
+    // The dialog validates + normalizes the optional custom size (locale-safe parse, positive, within
+    // the nozzle_diameter max, not a duplicate); empty if the field was left blank.
+    const std::string custom_variant = dlg.get_custom_variant();
+
+    auto* tab = wxGetApp().get_tab(Preset::TYPE_PRINTER);
+    const std::string original = sel.name; // fallback selection if nothing was added
+    std::string last_added;                // newly-created variant to land on afterwards
+    int added = 0;
+
+    // Fork a system preset into a new user variant of `user_model`. For a custom size that the system
+    // model doesn't ship, `override_size` overrides nozzle_diameter on the (nearest-system) base so
+    // Tab::save_preset derives the right "<model> <size> nozzle" name and stamps printer_variant.
+    auto fork_from_system = [&](const std::string& size, const Preset* sys_preset, bool override_size) {
+        if (sys_preset == nullptr) return;
+        if (Preset* v = printers.find_preset(sys_preset->name, false)) v->is_visible = true;
+        tab->select_preset(sys_preset->name);
+        if (override_size) {
+            auto& cfg = printers.get_edited_preset().config;
+            if (auto* nd = dynamic_cast<ConfigOptionFloats*>(cfg.option("nozzle_diameter"))) {
+                double val = string_to_double_decimal_point(size);
+                if (nd->values.empty()) nd->values.push_back(val);
+                else for (double& v : nd->values) v = val;
+            }
+        }
+        tab->save_preset(user_model);
+        // Only record the new variant if the save actually produced a user preset for this model. A
+        // failed / early-returning save (e.g. the collision or empty-name backstops in
+        // Tab::save_preset) leaves the SYSTEM preset selected — which must not become last_added, or
+        // the final selection would land on a system preset.
+        const Preset& saved = printers.get_selected_preset();
+        if (saved.is_user() && saved.config.opt_string("printer_model") == user_model) {
+            last_added = saved.name;
+            ++added;
+        }
+    };
+
+    for (const std::string& size : to_add)
+        fork_from_system(size, printers.find_system_preset_by_model_and_variant(sys_model, size), false);
+
+    // Custom size: exact system match if one exists, otherwise inherit the nearest system size.
+    if (!custom_variant.empty() && existing.count(custom_variant) == 0 &&
+        std::find(to_add.begin(), to_add.end(), custom_variant) == to_add.end()) {
+        const Preset* exact = printers.find_system_preset_by_model_and_variant(sys_model, custom_variant);
+        if (exact != nullptr) {
+            fork_from_system(custom_variant, exact, false);
+        } else {
+            const double target = string_to_double_decimal_point(custom_variant);
+            const Preset* nearest = nullptr;
+            double best = 1e9, best_val = -1.0;
+            for (const std::string& s : system_sizes) {
+                const double v = string_to_double_decimal_point(s);
+                const double diff = std::abs(v - target);
+                // Nearest by absolute diameter difference; on a tie (e.g. 0.9 between 0.8 and 1.0)
+                // round UP — prefer the larger nozzle, whose flow settings suit a big custom nozzle.
+                if (diff < best - 1e-9 || (std::abs(diff - best) <= 1e-9 && v > best_val)) {
+                    best = diff; best_val = v;
+                    nearest = printers.find_system_preset_by_model_and_variant(sys_model, s);
+                }
+            }
+            fork_from_system(custom_variant, nearest, true); // inherit nearest system size (ties round up)
+        }
+    }
+
+    // Land on the just-added nozzle variant (so the dropdown reflects the new selection); if nothing
+    // was added, stay on the printer the user started on.
+    const std::string select_name = !last_added.empty() ? last_added : original;
+    if (printers.find_preset(select_name, false) != nullptr)
+        tab->select_preset(select_name);
+
+    if (added > 0)
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": added " << added << " nozzle variant(s) to user model '" << user_model << "'.";
 }
 
 bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_manual)
@@ -3745,6 +3886,15 @@ void Sidebar::update_presets(Preset::Type preset_type)
             for (size_t i = 0; i < diameters.size(); ++i)
                 p->combo_nozzle_dia->Append(diameters[i], {});
             p->combo_nozzle_dia->SetSelection((*p->single_extruder).combo_diameter->GetSelection());
+
+            // ORCA #12105: for a user printer, offer "--Add nozzle --" at the end of both the
+            // single-extruder combo and the unified combo (same trailing index, so the unified->single
+            // forwarding still maps). System printers can't gain user variants, so it's user-only.
+            if (printer_preset.is_user()) {
+                const wxString add_item = add_nozzle_item_label();
+                p->single_extruder->combo_diameter->Append(add_item, {});
+                p->combo_nozzle_dia->Append(add_item, {});
+            }
             
             // ORCA update nozzle type
             const auto& full_config = wxGetApp().preset_bundle->full_config();
@@ -7033,7 +7183,7 @@ struct Plater::priv
     void remove(size_t obj_idx);
     bool delete_object_from_model(size_t obj_idx, bool refresh_immediately = true); //BBS
     void delete_all_objects_from_model();
-    void reset(bool apply_presets_change = false);
+    void reset(bool apply_presets_change = false, bool reload_presets = true);
     void center_selection();
     void drop_selection();
     void mirror(Axis axis);
@@ -7891,7 +8041,8 @@ Plater::priv::priv(Plater *q, MainFrame *main_frame)
             
             if (this->q->get_project_filename().IsEmpty() && this->q->is_empty_project()) {
                 int skip_confirm = e.GetInt();
-                this->q->new_project(skip_confirm, true);
+                // Skips the preset reload; trigger_restore_project()'s callers load the presets first.
+                this->q->new_project(skip_confirm, true, wxString(), false);
             }
         });
         //wxPostEvent(this->q, wxCommandEvent{EVT_RESTORE_PROJECT});
@@ -10356,7 +10507,7 @@ void Plater::priv::delete_all_objects_from_model()
     model.plates_custom_gcodes.clear();
 }
 
-void Plater::priv::reset(bool apply_presets_change)
+void Plater::priv::reset(bool apply_presets_change, bool reload_presets)
 {
     // TakeSnapshot below and load_current_presets() further down each re-evaluate the
     // aggregate dirty flag against a baseline that hasn't been reset yet, so they can toggle
@@ -10411,8 +10562,8 @@ void Plater::priv::reset(bool apply_presets_change)
     // Same reason, one level up: the Design tab keeps the editable document, not the Model, so
     // clearing the recipe alone leaves the tab showing the previous project's feature tree —
     // and its next edit syncs that tree straight back into the new project.
-    if (wxGetApp().mainframe != nullptr && wxGetApp().mainframe->m_design_panel != nullptr)
-        wxGetApp().mainframe->m_design_panel->clear_document();
+    if (DesignPanel* design = DesignPanel::if_built())
+        design->clear_document();
 #endif
     assemble_view->get_canvas3d()->reset_explosion_ratio();
     update();
@@ -10431,7 +10582,7 @@ void Plater::priv::reset(bool apply_presets_change)
     wxGetApp().preset_bundle->reset_project_embedded_presets();
     if (apply_presets_change)
         wxGetApp().apply_keeped_preset_modifications();
-    else
+    else if (reload_presets)
         wxGetApp().load_current_presets(false, false);
 
     //BBS
@@ -13183,17 +13334,17 @@ void Plater::priv::on_tab_selection_changing(wxBookCtrlEvent& e)
         // Pointer test, not a name lookup: in printer-agents mode this page is TAB_ID_MONITOR_WEB
         // while the native Device tab holds TAB_ID_MONITOR, and in legacy-web mode it holds
         // TAB_ID_MONITOR itself.
-        const bool selecting_web_device_tab = main_frame->m_printer_view &&
-            main_frame->m_tabpanel->GetPage(new_sel) == main_frame->m_printer_view;
+        const bool selecting_web_device_tab = main_frame->m_printer_view_page &&
+            main_frame->m_tabpanel->GetPage(new_sel) == main_frame->m_printer_view_page;
         if (selecting_web_device_tab) {
             // Use the selected discovered machine when the preset has no host.
             main_frame->load_printer_url();
         } else if (new_name == TAB_ID_MONITOR && wxGetApp().preset_bundle != nullptr) {
             auto     cfg = wxGetApp().preset_bundle->printers.get_edited_preset().config;
             wxString url = from_u8(PrintHost::get_print_host_webui(&cfg));
-            if (main_frame->m_printer_view && url.empty()) {
+            if (PrinterWebView* view = PrinterWebView::if_built(); view != nullptr && url.empty()) {
                 // It's missing_connection page, reload so that we can replay the gif image
-                main_frame->m_printer_view->reload();
+                view->reload();
             }
         }
     }
@@ -13924,8 +14075,8 @@ void Plater::priv::unbind_canvas_event_handlers()
     // The Design tab's viewport is a fourth GLCanvas3D on the same shared GL context, owned by
     // MainFrame rather than by us — same reach as reset() uses for clear_document(). Null until
     // the tab has been opened once, so most sessions skip it.
-    if (wxGetApp().mainframe != nullptr && wxGetApp().mainframe->m_design_panel != nullptr)
-        wxGetApp().mainframe->m_design_panel->unbind_canvas_event_handlers();
+    if (DesignPanel* design = DesignPanel::if_built())
+        design->unbind_canvas_event_handlers();
 #endif
 }
 
@@ -13938,8 +14089,8 @@ void Plater::priv::reset_canvas_volumes()
         preview->get_canvas3d()->reset_volumes();
 
 #ifdef SLIC3R_CAD
-    if (wxGetApp().mainframe != nullptr && wxGetApp().mainframe->m_design_panel != nullptr)
-        wxGetApp().mainframe->m_design_panel->reset_canvas_volumes();
+    if (DesignPanel* design = DesignPanel::if_built())
+        design->reset_canvas_volumes();
 #endif
 }
 
@@ -15351,7 +15502,7 @@ Print&          Plater::fff_print()         { return p->fff_print; }
 const SLAPrint& Plater::sla_print() const   { return p->sla_print; }
 SLAPrint&       Plater::sla_print()         { return p->sla_print; }
 
-int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_name)
+int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_name, bool reload_presets)
 {
     model().calib_pa_pattern.reset(nullptr);
     model().plates_custom_gcodes.clear();
@@ -15399,7 +15550,7 @@ int Plater::new_project(bool skip_confirm, bool silent, const wxString& project_
         // completes, so hold notifications until then to avoid firing on transient flips.
         ProjectDirtyStateManager::NotificationSuppressor dirty_notify_suppressor(p->dirty_state);
 
-        reset(transfer_preset_changes);
+        reset(transfer_preset_changes, reload_presets);
         reset_project_dirty_after_save();
         reset_project_dirty_initial_presets();
         wxGetApp().update_saved_preset_from_current_preset();
@@ -17984,7 +18135,7 @@ void Plater::deselect_all() { p->deselect_all(); }
 void Plater::exit_gizmo() { p->exit_gizmo(); }
 
 void Plater::remove(size_t obj_idx) { p->remove(obj_idx); }
-void Plater::reset(bool apply_presets_change) { p->reset(apply_presets_change); }
+void Plater::reset(bool apply_presets_change, bool reload_presets) { p->reset(apply_presets_change, reload_presets); }
 void Plater::reset_with_confirm()
 {
     if (p->model.objects.empty() || MessageDialog(static_cast<wxWindow *>(this), _L("All objects will be removed, continue?"),
@@ -20001,7 +20152,7 @@ int Plater::export_config_3mf(int plate_idx, Export3mfProgressFn proFn)
 void Plater::send_calibration_job_finished(wxCommandEvent & evt)
 {
     p->main_frame->request_select_tab(TAB_ID_CALIBRATION);
-    auto calibration_panel = p->main_frame->m_calibration;
+    CalibrationPanel* calibration_panel = CalibrationPanel::ensure();
     if (calibration_panel) {
         auto curr_wizard = static_cast<CalibrationWizard*>(calibration_panel->get_tabpanel()->GetPage(evt.GetInt()));
         wxCommandEvent event(EVT_CALIBRATION_JOB_FINISHED);
@@ -20033,8 +20184,8 @@ void Plater::print_job_finished(wxCommandEvent &evt)
 
     dev->set_selected_machine(evt.GetString().ToStdString());
     p->main_frame->request_select_tab(TAB_ID_MONITOR);
-    //jump to monitor and select device status panel
-    MonitorPanel* curr_monitor = p->main_frame->m_monitor;
+    // Selects the status page on a built Device tab; one built by the switch starts there.
+    MonitorPanel* curr_monitor = MonitorPanel::if_built();
     if(curr_monitor)
        curr_monitor->get_tabpanel()->ChangeSelection(MonitorPanel::PrinterTab::PT_STATUS);
 }
@@ -20774,8 +20925,8 @@ void Plater::update_print_error_info(int code, std::string msg, std::string extr
     if (p->m_send_to_sdcard_dlg) {
         p->m_send_to_sdcard_dlg->update_print_error_info(code, msg, extra);
     }
-    if (p->main_frame->m_calibration)
-        p->main_frame->m_calibration->update_print_error_info(code, msg, extra);
+    if (CalibrationPanel* calibration = CalibrationPanel::if_built())
+        calibration->update_print_error_info(code, msg, extra);
 }
 
 wxString Plater::get_project_filename(const wxString& extension) const
@@ -21068,7 +21219,8 @@ void Plater::pop_warning_and_go_to_device_page(wxString printer_name, PrinterWar
 {
     printer_name.Replace("Bambu Lab", "", false);
     wxString content;
-    bool device_page = (wxGetApp().mainframe == nullptr) && (wxGetApp().mainframe->m_monitor->IsShown());
+    MainFrame* frame       = wxGetApp().mainframe;
+    bool       device_page = frame != nullptr && frame->m_monitor_page->in_book();
     if (type == PrinterWarningType::NOT_CONNECTED) {
         if (device_page) {
             content = wxString::Format(_L("Printer not connected. Please go to the device page to connect %s before syncing."),
